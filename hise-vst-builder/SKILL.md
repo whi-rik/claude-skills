@@ -20,14 +20,14 @@ quality: validated
 
 HISE's VST3 export pipeline has multiple undocumented gotchas where settings are silently ignored. The compiled frontend plugin behaves fundamentally differently from the HISE backend - Builder API crashes in frontend mode, project_info.xml settings are not propagated to the .jucer file, and the compiled plugin resolves its app data path using hardcoded "My Company" instead of the configured CompanyName.
 
-The working pattern is: **one sampler per plugin, XML preset + Interface.js (no Save Archive needed), fix .jucer after export, and create LinkOSX at the "My Company" path.**
+The working pattern is: **one sampler per plugin, XML preset + Interface.js (no Save Archive needed), fix .jucer after export, and create LinkOSX/LinkWindows at the "My Company" path.**
 
 ## Why This Matters
 
 Without knowing these gotchas:
 - Builder code in onInit causes force-mute/crash in DAWs (NaN audio output)
 - Multiple plugins get the same VST3 ID ("Abcd") so only one appears in DAW scan
-- Plugin asks for sample folder every load because LinkOSX is at wrong path
+- Plugin asks for sample folder every load because LinkOSX/LinkWindows is at wrong path
 - Complex multi-sampler plugins crash while single-sampler ones work fine
 
 ## Recognition Pattern
@@ -79,6 +79,30 @@ RIGHT (XML attributes):
           RRGroup="1" FileName="{PROJECT_FOLDER}subfolder/sample.wav" />
 </samplemap>
 ```
+
+### SampleMap Generation from config.json
+
+Sample source directories typically contain a `config.json` with all mapping info:
+```json
+{
+  "instrument_name": "Amati_Viola",
+  "range": { "lo_note": 48, "hi_note": 86 },
+  "sampling_interval": 3,
+  "articulations": [{
+    "name": "sustain",
+    "velocity_layers": [
+      { "name": "dynamic1", "lo_vel": 0, "hi_vel": 42 },
+      { "name": "dynamic2", "lo_vel": 43, "hi_vel": 84 },
+      { "name": "dynamic3", "lo_vel": 85, "hi_vel": 127 }
+    ]
+  }]
+}
+```
+
+**LoKey/HiKey calculation** for 3-semitone intervals:
+- First note: LoKey = lo_note
+- Last note: HiKey = hi_note
+- Middle notes: LoKey = floor((prev_root + root) / 2) + 1, HiKey = floor((root + next_root) / 2)
 
 ### Fully Automated Method: XML Preset + Interface.js (RECOMMENDED)
 
@@ -182,7 +206,8 @@ ALL callback functions (onNoteOn, onNoteOff, onController, onTimer, onControl) M
 </Processor>
 ```
 
-**3. Build Pipeline (fully automated):**
+### macOS Build Pipeline (fully automated)
+
 ```bash
 # 1. Set project folder
 HISE set_project_folder -p:/path/to/project
@@ -206,119 +231,55 @@ xcodebuild -project "Builds/MacOSX/name.xcodeproj" -configuration "Release" -job
 cp -r Builds/MacOSX/build/Release/name.vst3 ~/Library/Audio/Plug-Ins/VST3/inst/name/
 ```
 
-### Alternative: HISE MCP Server Workflow (requires manual Save Archive)
+### Windows Build Pipeline (VALIDATED)
 
-If you need to use the HISE runtime for testing before export:
+**CRITICAL Windows gotchas:**
+1. **UNC paths (`\\server\share`)** — PowerShell `-Command` inline strips double backslashes. **ALWAYS use `.ps1` files executed with `-File` flag** for UNC paths.
+2. **HISE CLI output capture** — `& $HISE` doesn't capture output. Use `Start-Process -RedirectStandardOutput` instead.
+3. **HISE export generates `VisualStudio2026` folder** (not 2022) — the .sln is at `Binaries\Builds\VisualStudio2026\{name}.sln`
+4. **MSBuild can hang on NAS paths** — Use `Start-Process -Wait` with `-RedirectStandardOutput` to avoid. If it hangs, kill and retry.
+5. **Admin rights needed** for `C:\Program Files\Common Files\VST3\` — use `Start-Process -Verb RunAs` or run elevated.
+6. **`-nolto` flag** — Add to HISE export for faster builds (skips link time optimization).
+7. **64-bit MSBuild** — Use `amd64\MsBuild.exe` to avoid C1002 heap errors on large projects.
+8. **LinkWindows printf** — Do NOT use `printf` (interprets `\v` as vertical tab). Use `[IO.File]::WriteAllText()` instead.
 
-```bash
-# Launch HISE with REST API
-HISE set_project_folder -p:/path/to/project
-open -a /Applications/HISE.app --args start_server
-
-# Create modules (REST API)
-curl -X POST http://127.0.0.1:1900/api/builder/apply \
-  -d '{"operations": [
-    {"op": "add", "type": "StreamingSampler", "parent": "Master Chain", "chain": -1, "name": "Sampler"}
-  ]}'
-
-# Set script (REST API) - NO Builder code!
-curl -X POST http://127.0.0.1:1900/api/set_script \
-  -d '{"moduleId":"Interface","callbacks":{"onInit":"..."},"compile":true}'
-
-# Test sound
-# Use mcp__hise__hise_runtime_repl: Synth.playNote(67, 100)
-
-# Save: USER MUST DO File -> Save Archive manually (no API)
-# Then export from .hip file instead of .xml
-```
-
-### Windows Build Pipeline
-
-Windows uses the same project files (SampleMap, Interface.js, XML preset, project_info.xml). Only the build commands differ.
-
+**Validated Windows build script (.ps1):**
 ```powershell
+$HISE = 'C:\workspace\HISE\projects\standalone\Builds\VisualStudio2026\x64\Release\App\HISE.exe'
+$Projucer = 'C:\workspace\HISE\JUCE\extras\Projucer\Builds\VisualStudio2022\x64\Release\App\Projucer.exe'
+$MSBuild = 'C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe'
+$HISESource = 'C:\workspace\HISE'
+
 # 1. Set project folder
-HISE.exe set_project_folder -p:C:\path\to\project
+$stdout = [IO.Path]::GetTempFileName()
+$stderr = [IO.Path]::GetTempFileName()
+Start-Process -FilePath $HISE -ArgumentList 'set_project_folder',"-p:$projDir" -NoNewWindow -Wait -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
 
 # 2. Export from XML
-HISE.exe export C:\path\to\XmlPresetBackups\project_name.xml -t:instrument -p:VST3 -h:C:\path\to\HISE\source
+Start-Process -FilePath $HISE -ArgumentList 'export',$xmlPreset,'-t:instrument','-p:VST3',"-h:$HISESource",'-nolto' -NoNewWindow -Wait -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
 
-# 3. FIX .jucer (PowerShell)
-$jucer = "C:\path\to\Binaries\AutogeneratedProject.jucer"
-(Get-Content $jucer) -replace 'pluginManufacturer="My Company"','pluginManufacturer="mycompany"' `
-  -replace 'pluginManufacturerCode="Abcd"','pluginManufacturerCode="Myco"' `
-  -replace 'pluginCode="Abcd"','pluginCode="Uniq"' `
-  -replace 'com\.myCompany\.product','com.mycompany.pluginname' | Set-Content $jucer
+# 3. Fix .jucer
+$jucerPath = "$projDir\Binaries\AutogeneratedProject.jucer"
+$content = Get-Content -LiteralPath $jucerPath -Raw
+$content = $content -replace 'pluginManufacturer="My Company"', 'pluginManufacturer="whirik"'
+$content = $content -replace 'pluginManufacturerCode="Abcd"', 'pluginManufacturerCode="Whir"'
+$content = $content -replace 'pluginCode="Abcd"', "pluginCode=`"$pluginCode`""
+$content = $content -replace 'com\.myCompany\.product', "com.whirik.$pluginName"
+Set-Content -LiteralPath $jucerPath -Value $content
 
 # 4. Projucer resave
-Projucer.exe --resave AutogeneratedProject.jucer
+Start-Process -FilePath $Projucer -ArgumentList '--resave',$jucerPath -NoNewWindow -Wait -PassThru
 
-# 5. Compile (Visual Studio 2022)
-msbuild "Builds\VisualStudio2022\project_name.sln" /p:Configuration=Release /p:Platform=x64
+# 5. Compile — .sln is in Builds\VisualStudio2026\ (NOT 2022!)
+$slnPath = "$projDir\Binaries\Builds\VisualStudio2026\$pluginName.sln"
+Start-Process -FilePath $MSBuild -ArgumentList "`"$slnPath`"",'/p:Configuration=Release','/p:Platform=x64','/m' -NoNewWindow -Wait -PassThru
 
-# 6. Install
-copy "Builds\VisualStudio2022\x64\Release\VST3\project_name.vst3" "C:\Program Files\Common Files\VST3\"
+# 6. Result at: Binaries\Compiled\VST3\{name}.vst3
 ```
 
-**Windows LinkWindows sample path:**
-```powershell
-# Create sample link at:
-# %APPDATA%\My Company\plugin_name\LinkWindows
-$dir = "$env:APPDATA\My Company\plugin_name"
-New-Item -ItemType Directory -Force -Path $dir
-[System.IO.File]::WriteAllText("$dir\LinkWindows", "C:\path\to\Samples")
+**IMPORTANT**: For UNC paths, the entire script MUST be saved as a `.ps1` file and run with:
 ```
-
-**Windows vs macOS differences:**
-| Item | macOS | Windows |
-|------|-------|---------|
-| Compiler | Xcode (xcodebuild) | Visual Studio (msbuild) |
-| VST3 path | ~/Library/Audio/Plug-Ins/VST3/ | C:\Program Files\Common Files\VST3\ |
-| Sample link | LinkOSX | LinkWindows |
-| App data | ~/Library/Application Support/ | %APPDATA% |
-| HISE binary | /Applications/HISE.app/Contents/MacOS/HISE | HISE.exe |
-
-### CRITICAL: Each Plugin Needs Unique IDs
-
-When building multiple plugins:
-- `pluginCode` must be unique 4-char code per plugin (e.g., "Wsu1", "Wst1", "Wpz1")
-- `CFBundleIdentifier` must be unique (e.g., "com.company.plugin_sustain")
-- If IDs collide, DAW only shows ONE plugin in scan results
-
-### Sample Location (LinkOSX)
-
-Compiled HISE plugins look for samples via LinkOSX file. **CRITICAL**: The path uses "My Company" regardless of project_info.xml CompanyName:
-
-```bash
-# This is where the compiled plugin ACTUALLY looks:
-mkdir -p ~/Library/Application\ Support/My\ Company/plugin_name
-printf '/path/to/Samples' > ~/Library/Application\ Support/My\ Company/plugin_name/LinkOSX
-```
-
-Without trailing newline! Use `printf`, not `echo`.
-
-### HISE MCP Server Workflow
-
-```bash
-# Launch HISE with REST API
-HISE set_project_folder -p:/path/to/project
-open -a /Applications/HISE.app --args start_server
-
-# Create modules (REST API)
-curl -X POST http://127.0.0.1:1900/api/builder/apply \
-  -d '{"operations": [
-    {"op": "add", "type": "StreamingSampler", "parent": "Master Chain", "chain": -1, "name": "Sampler"}
-  ]}'
-
-# Set script (REST API)
-curl -X POST http://127.0.0.1:1900/api/set_script \
-  -d '{"moduleId":"Interface","callbacks":{"onInit":"..."},"compile":true}'
-
-# Test sound
-# Use mcp__hise__hise_runtime_repl: Synth.playNote(67, 100)
-
-# Save: USER MUST DO File -> Save Archive manually (no API)
-# Shutdown: POST /api/shutdown
+powershell.exe -ExecutionPolicy Bypass -File "C:\path\to\script.ps1"
 ```
 
 ### Automatic Envelope (ADSR) from Sample Analysis
@@ -347,6 +308,77 @@ Instrument type classification:
 
 The pipeline (`run_pipeline.py`) auto-generates `_envelope.json` alongside sliced samples.
 
+### CRITICAL: Each Plugin Needs Unique IDs
+
+When building multiple plugins:
+- `pluginCode` must be unique 4-char code per plugin (e.g., "Wavi", "Wrfc", "Wsot")
+- `CFBundleIdentifier` must be unique (e.g., "com.whirik.whirik_Amati_Viola")
+- If IDs collide, DAW only shows ONE plugin in scan results
+
+### Sample Location (LinkOSX / LinkWindows)
+
+Compiled HISE plugins look for samples via LinkOSX/LinkWindows file. **CRITICAL**: The path uses "My Company" regardless of project_info.xml CompanyName:
+
+**macOS:**
+```bash
+mkdir -p ~/Library/Application\ Support/My\ Company/plugin_name
+printf '/path/to/Samples' > ~/Library/Application\ Support/My\ Company/plugin_name/LinkOSX
+```
+Without trailing newline! Use `printf`, not `echo`.
+
+**Windows:**
+```powershell
+$dir = "$env:APPDATA\My Company\plugin_name"
+New-Item -ItemType Directory -Force -Path $dir
+[System.IO.File]::WriteAllText("$dir\LinkWindows", "C:\path\to\Samples")
+```
+Do NOT use `printf` on Windows (interprets `\v` as vertical tab). Always use `[IO.File]::WriteAllText()`.
+
+### NAS Deployment (Multi-PC sharing)
+
+Compiled .vst3 files are standalone binaries. Other PCs do NOT need HISE, Visual Studio, or Projucer.
+
+**Setup for sharing via NAS:**
+1. Copy all .vst3 files to a shared NAS folder
+2. Create a `setup_linkwindows.ps1`:
+
+```powershell
+$plugins = @('whirik_Amati_Viola','whirik_Requiem_For_Cello','whirik_Strings_Of_Thrones')
+foreach ($name in $plugins) {
+    $dir = "$env:APPDATA\My Company\$name"
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    [IO.File]::WriteAllText("$dir\LinkWindows", "\\NAS\share\HISE\$name\Samples")
+    Write-Host "OK: $name"
+}
+```
+
+3. On each PC: run `setup_linkwindows.ps1`, then in Reaper add VST3 scan path pointing to NAS
+4. **NO local disk space needed** for samples or plugins
+
+### Alternative: HISE MCP Server Workflow (requires manual Save Archive)
+
+If you need to use the HISE runtime for testing before export:
+
+```bash
+# Launch HISE with REST API
+HISE set_project_folder -p:/path/to/project
+open -a /Applications/HISE.app --args start_server
+
+# Create modules (REST API)
+curl -X POST http://127.0.0.1:1900/api/builder/apply \
+  -d '{"operations": [
+    {"op": "add", "type": "StreamingSampler", "parent": "Master Chain", "chain": -1, "name": "Sampler"}
+  ]}'
+
+# Set script (REST API) - NO Builder code!
+curl -X POST http://127.0.0.1:1900/api/set_script \
+  -d '{"moduleId":"Interface","callbacks":{"onInit":"..."},"compile":true}'
+
+# Test sound: Synth.playNote(67, 100)
+# Save: USER MUST DO File -> Save Archive manually (no API)
+# Shutdown: POST /api/shutdown
+```
+
 ### Multi-Articulation Strategy
 
 Instead of one plugin with multiple samplers (causes crashes), build **one plugin per articulation**:
@@ -356,15 +388,54 @@ Instead of one plugin with multiple samplers (causes crashes), build **one plugi
 
 Each gets its own project folder, sample map, unique plugin code, and separate track in DAW.
 
+### Batch Build Pattern (validated)
+
+For building multiple plugins at once:
+
+```powershell
+$plugins = @(
+    @{ Name = 'whirik_Amati_Viola'; PluginCode = 'Wavi'; SrcFolder = 'Amati_Viola' },
+    @{ Name = 'whirik_Requiem_For_Cello'; PluginCode = 'Wrfc'; SrcFolder = 'Requiem_For_Cello' }
+)
+foreach ($plugin in $plugins) {
+    # 1. Create directory structure + copy samples
+    # 2. Generate SampleMap XML (parse config.json for velocity layers)
+    # 3. Generate project_info.xml, Interface.js, XML preset
+    # 4. HISE set_project_folder + export
+    # 5. Fix .jucer, Projucer resave, MSBuild compile
+    # 6. Install .vst3, create LinkWindows
+}
+```
+
+### Platform Differences
+
+| Item | macOS | Windows |
+|------|-------|---------|
+| Compiler | Xcode (xcodebuild) | Visual Studio (msbuild) |
+| VST3 install path | ~/Library/Audio/Plug-Ins/VST3/ | C:\Program Files\Common Files\VST3\ |
+| Sample link file | LinkOSX | LinkWindows |
+| App data | ~/Library/Application Support/ | %APPDATA% |
+| HISE binary | /Applications/HISE.app/Contents/MacOS/HISE | HISE.exe |
+| VS build folder | Builds/MacOSX/ | Builds\VisualStudio2026\ (NOT 2022) |
+| VST3 output | Builds/MacOSX/build/Release/ | Binaries\Compiled\VST3\ |
+| Link file write | `printf` (no newline) | `[IO.File]::WriteAllText()` (NOT printf) |
+
 ## Gotchas Summary
 
 | Issue | Cause | Fix |
 |-------|-------|-----|
 | Plugin crashes on MIDI note | Builder code in script | Remove all Builder code from onInit |
 | Only 1 of N plugins shows in DAW | Same pluginCode "Abcd" | Unique 4-char code per plugin in .jucer |
-| "Choose Sample Folder" on every load | LinkOSX at wrong path | Use "My Company" path, not custom company |
+| "Choose Sample Folder" on every load | Link file at wrong path | Use "My Company" path, not custom company |
 | project_info.xml ignored | Wrong XML format | Use attributes, not child elements |
 | Plugin shows "My Company" | Export ignores CompanyName | Fix pluginManufacturer in .jucer |
 | Save Archive has no API | HISE limitation | Use XML preset method instead (fully automated) |
 | HISE loads Autosave on start | Default behavior | Use File -> Open Archive to load specific .hip |
 | Compile timeout on set_script | Sample loading takes time | Set minimal script first, edit incrementally |
+| UNC path loses `\\` in PowerShell | `-Command` inline strips backslashes | Save as .ps1 file, run with `-File` flag |
+| HISE CLI no output with `&` | `&` operator doesn't capture | Use `Start-Process -RedirectStandardOutput` |
+| MSBuild hangs on NAS paths | Network I/O stalls | Use `Start-Process -Wait`, kill and retry |
+| C1002 compiler heap error | 32-bit MSBuild | Use `amd64\MsBuild.exe` 64-bit version |
+| LinkWindows `\v` corruption | `printf` interprets backslash escapes | Use `[IO.File]::WriteAllText()` |
+| VST3 install permission denied | Program Files requires admin | `Start-Process -Verb RunAs` for elevated copy |
+| .sln in wrong VS folder | Expecting VisualStudio2022 | HISE generates `VisualStudio2026` — check actual folder |
