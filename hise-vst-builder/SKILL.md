@@ -321,6 +321,32 @@ curl -X POST http://127.0.0.1:1900/api/set_script \
 # Shutdown: POST /api/shutdown
 ```
 
+### Automatic Envelope (ADSR) from Sample Analysis
+
+Use `envelope_analyzer.py` to analyze sliced samples and set HISE envelope values automatically:
+
+```python
+from envelope_analyzer import analyze_folder
+env = analyze_folder("/path/to/samples")
+# env = {"attack_ms": 5.0, "release_ms": 700.0, "type": "short", "hise_attack": 0, "hise_release": 70}
+```
+
+Apply to XML preset by replacing `Attack` and `Release` in the `SimpleEnvelope` processor:
+```xml
+<Processor Type="SimpleEnvelope" ID="DefaultEnvelope" Attack="0" Release="70" .../>
+```
+
+Instrument type classification:
+| Type | Attack | Sustain | Examples |
+|------|--------|---------|----------|
+| percussive | <5ms | <0.1 | Drums, plucks |
+| short | <20ms | <0.3 | Staccato, pizzicato |
+| sustain | any | >0.6 | Strings, winds |
+| pad | >100ms | >0.5 | Pads, ambient |
+| natural | other | other | Default |
+
+The pipeline (`run_pipeline.py`) auto-generates `_envelope.json` alongside sliced samples.
+
 ### Multi-Articulation Strategy
 
 Instead of one plugin with multiple samplers (causes crashes), build **one plugin per articulation**:
