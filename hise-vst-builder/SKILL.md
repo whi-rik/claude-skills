@@ -282,6 +282,34 @@ Start-Process -FilePath $MSBuild -ArgumentList "`"$slnPath`"",'/p:Configuration=
 powershell.exe -ExecutionPolicy Bypass -File "C:\path\to\script.ps1"
 ```
 
+### Sampling Best Practices (Validated v24)
+
+**Recording:**
+- **vel=127** for maximum brightness/volume — vel=90 produces dull samples (ZCR 753 vs 1022)
+- **1 velocity layer** + HISE VelocityMod — multi-layer causes volume inconsistency, 1/5 recording time
+- **Individual render (sequential)** — one MIDI per note, Kontakt loads once via `render_sequential.lua`. Eliminates slicing artifacts
+- **CC11=127** during recording for sustained instruments
+
+**Sample Post-Processing:**
+- **Trim leading silence** — individual renders have ~200ms lead-in. Trim to 10ms before onset
+- **Apply 5ms fade-in** — eliminates pop/click at note start. More effective than HISE Attack parameter
+- These two steps reduced pops from 236 → 19 (Kontakt has 40)
+
+**HISE Settings (Piano Checkpoint v24):**
+| Parameter | Value | Why |
+|-----------|-------|-----|
+| Gain | 1.3 | Kontakt-level with vel=127 samples |
+| Attack | 5 | Samples have built-in fade-in |
+| Release | 800 | Rich sustain tail |
+| VelocityMod | Intensity=0.5, DecibelMode=0 | Linear mode, avoid excessive attenuation |
+| FX | **NONE** | SimpleReverb causes clipping (see below) |
+
+**CRITICAL: HISE SimpleReverb Clipping Bug:**
+SimpleReverb `WetLevel` controls both wet AND dry levels (dry = 1 - wet). Adding ANY SimpleReverb to the FX chain causes clipping regardless of WetLevel value. **Always add reverb/EQ in the DAW, not in HISE.**
+
+**PolyphonicFilter Gain is LINEAR, not dB:**
+`Gain="3"` means 3x volume (+9.5dB), not +3dB. This causes immediate clipping. Do not use PolyphonicFilter for EQ boost in compiled plugins.
+
 ### Automatic Envelope (ADSR) from Sample Analysis
 
 Use `envelope_analyzer.py` to analyze sliced samples and set HISE envelope values automatically:
@@ -439,3 +467,8 @@ foreach ($plugin in $plugins) {
 | LinkWindows `\v` corruption | `printf` interprets backslash escapes | Use `[IO.File]::WriteAllText()` |
 | VST3 install permission denied | Program Files requires admin | `Start-Process -Verb RunAs` for elevated copy |
 | .sln in wrong VS folder | Expecting VisualStudio2022 | HISE generates `VisualStudio2026` — check actual folder |
+| SimpleReverb clipping | WetLevel controls dry+wet simultaneously | Do NOT use SimpleReverb in HISE — add reverb in DAW |
+| PolyphonicFilter clipping | Gain parameter is linear multiplier, not dB | Do NOT use for EQ boost — Gain="3" = +9.5dB |
+| Sample pops/clicks | Leading silence + abrupt start | Trim 200ms silence + 5ms fade-in on WAV files |
+| Dull/dark samples | Low recording velocity | Record at **vel=127** for maximum brightness |
+| Multi-velocity inconsistency | Layer volume mismatch | Use **1 velocity layer** + VelocityMod instead |
